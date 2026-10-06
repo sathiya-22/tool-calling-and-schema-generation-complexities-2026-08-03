@@ -1,6 +1,7 @@
 import pytest
 import asyncio
 from tool_registry import ToolRegistry, ToolCall
+from pydantic import ValidationError
 
 @pytest.fixture
 def registry():
@@ -118,4 +119,26 @@ async def test_tool_execution_runtime_error(registry):
 
     tool_call = ToolCall(tool_name="divide_by_zero", arguments={"numerator": 10, "denominator": 0})
     with pytest.raises(RuntimeError, match="Error executing tool 'divide_by_zero'"):
+        await registry.execute_tool_call(tool_call)
+
+@pytest.mark.asyncio
+async def test_execute_tool_call_invalid_argument_type_raises_error(registry):
+    @registry.register_tool
+    def process_number(value: int) -> int:
+        """Processes an integer."""
+        return value * 2
+
+    tool_call = ToolCall(tool_name="process_number", arguments={"value": "not_an_int"})
+    with pytest.raises(ValueError, match="received invalid arguments"):
+        await registry.execute_tool_call(tool_call)
+
+@pytest.mark.asyncio
+async def test_execute_tool_call_extra_argument_raises_error(registry):
+    @registry.register_tool
+    def simple_func(param1: str) -> str:
+        """A simple function."""
+        return param1
+
+    tool_call = ToolCall(tool_name="simple_func", arguments={"param1": "test", "extra_param": "unexpected"})
+    with pytest.raises(ValueError, match="received invalid arguments"):
         await registry.execute_tool_call(tool_call)

@@ -1,7 +1,7 @@
 from typing import Callable, Dict, Any, List, TypeVar
 import inspect
 import json
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, create_model, ValidationError
 
 # Type variable for the decorated function
 F = TypeVar('F', bound=Callable[..., Any])
@@ -24,6 +24,8 @@ class ToolRegistry:
     def __init__(self):
         self._tools: Dict[str, Callable[..., Any]] = {}
         self._schemas: Dict[str, ToolSchema] = {}
+        # Store the dynamically created Pydantic models for direct validation
+        self._arg_models: Dict[str, type[BaseModel]] = {}
 
     def register_tool(self, func: F) -> F:
         """
@@ -36,10 +38,12 @@ class ToolRegistry:
             raise ValueError(f"Tool '{tool_name}' already registered.")
 
         self._tools[tool_name] = func
-        self._schemas[tool_name] = self._generate_schema(func)
+        schema, arg_model = self._generate_schema(func)
+        self._schemas[tool_name] = schema
+        self._arg_models[tool_name] = arg_model
         return func
 
-    def _generate_schema(self, func: Callable[..., Any]) -> ToolSchema:
+    def _generate_schema(self, func: Callable[..., Any]) -> tuple[ToolSchema, type[BaseModel]]:
         """Generates a Pydantic-compatible JSON schema for a given function."""
         signature = inspect.signature(func)
         docstring = inspect.getdoc(func) or ""
@@ -85,12 +89,11 @@ class ToolRegistry:
                param.kind == inspect.Parameter.KEYWORD_ONLY:
                 
                 field_type = param.annotation if param.annotation != inspect.Parameter.empty else Any
-                field_default = param.default if param.default != inspect.Parameter.empty else Field(..., description=param_descriptions.get(name, ""))
-
-                if field_default is Field(...): # Required argument
+                
+                if param.default != inspect.Parameter.empty: # Optional argument with a default
+                    fields[name] = (field_type, Field(param.default, description=param_descriptions.get(name, "")))
+                else: # Required argument
                     fields[name] = (field_type, Field(..., description=param_descriptions.get(name, "")))
-                else: # Optional argument with a default
-                    fields[name] = (field_type, Field(field_default, description=param_descriptions.get(name, "")))
 
         # Create a Pydantic model dynamically for the function's arguments
         ArgsModel = create_model(f"{func.__name__}Args", **fields)
@@ -101,7 +104,7 @@ class ToolRegistry:
                 "description": func_description,
                 "parameters": ArgsModel.model_json_schema()
             }
-        )
+        ), ArgsModel
 
     def get_tool_schemas(self) -> List[ToolSchema]:
         """Returns a list of all registered tool schemas."""
@@ -120,38 +123,20 @@ class ToolRegistry:
             raise ValueError(f"Tool '{tool_call.tool_name}' not found in registry.")
 
         tool_func = self._tools[tool_call.tool_name]
-        schema = self._schemas[tool_call.tool_name]
+        arg_model = self._arg_models[tool_call.tool_name]
 
         try:
-            # Validate arguments against the generated Pydantic schema
-            # We need to re-create the Pydantic model from the schema to validate
-            # This ensures consistent validation with the schema itself
-            func_schema_params = schema.function["parameters"]
-            
-            # Dynamically create a Pydantic model for validation
-            # This is a bit more involved than direct Pydantic parsing
-            # since we're working with a JSON schema.
-            # For simplicity, we'll rely on the existing Pydantic model creation
-            # during schema generation and assume the generated schema correctly
-            # reflects argument needs. Direct validation against model_json_schema
-            # requires a library like jsonschema or recreating the Pydantic model
-            # from the schema itself. For this prototype, we'll pass directly and
-            # let Python's type checking/runtime errors handle basic mismatches,
-            # trusting the LLM to adhere to the schema it was given.
-            # A more robust solution would dynamically load the Pydantic model
-            # used for schema generation or use `jsonschema.validate`.
-
-            # For now, we'll try to call directly.
-            # If the schema generation is correct, the LLM's call should match.
-            # A future improvement would be explicit `jsonschema.validate(tool_call.arguments, func_schema_params)`
+            # Validate arguments using the dynamically created Pydantic model
+            validated_args = arg_model(**tool_call.arguments).model_dump()
             
             if inspect.iscoroutinefunction(tool_func):
-                result = await tool_func(**tool_call.arguments)
+                result = await tool_func(**validated_args)
             else:
-                result = tool_func(**tool_call.arguments)
+                result = tool_func(**validated_args)
             return result
-        except TypeError as e:
+        except ValidationError as e:
+            # Pydantic's ValidationError provides detailed error messages
             raise ValueError(f"Tool '{tool_call.tool_name}' received invalid arguments: {e}. "
-                             f"Expected schema: {json.dumps(schema.function['parameters'], indent=2)}")
+                             f"Expected schema: {json.dumps(self._schemas[tool_call.tool_name].function['parameters'], indent=2)}")
         except Exception as e:
             raise RuntimeError(f"Error executing tool '{tool_call.tool_name}': {e}")
